@@ -18,18 +18,26 @@ mcp = FastMCP(
     name="GoAI Moat — AI Visibility Audit",
     instructions=(
         "Diagnose a brand's visibility in AI answers (ChatGPT, Perplexity, Google AI Overviews, Amazon Rufus). "
-        "Use audit_ai_visibility to run a deep audit: free tier gives 1 full audit per email; "
-        "a license key (https://niebingyu.gumroad.com/l/njpksu) unlocks unlimited audits. "
-        "get_checklist returns the full 30-point checklist, get_fix_priority turns a score into an action plan."
+        "Built for AI agents and developers: call audit_ai_visibility with an api_key to run audits programmatically. "
+        "Free tier = 1 full audit per email. A developer subscription (https://niebingyu.gumroad.com/l/njpksu) "
+        "provides an api_key that unlocks unlimited audits. "
+        "get_checklist returns the 30-point checklist; get_fix_priority turns a score into an action plan; "
+        "get_usage reports the caller's API usage volume."
     ),
 )
 
 DATA_DIR = os.environ.get("MCP_DATA_DIR", "/opt/gg-ai-brief/data")
 QUOTA_FILE = os.path.join(DATA_DIR, "mcp_quota.json")
 LICENSE_CACHE = os.path.join(DATA_DIR, "mcp_licenses.json")
-GUMROAD_PRODUCT_ID = os.environ.get("GUMROAD_MCP_PRODUCT_ID", "MLYxk9ZsxLN2CkJCbFgV4g==")
+USAGE_FILE = os.path.join(DATA_DIR, "mcp_usage.json")
+# 支持多个 license 产品：$29/yr Audit License + $49 Developer API Access
+GUMROAD_PRODUCT_IDS = [
+    os.environ.get("GUMROAD_MCP_PRODUCT_ID", "MLYxk9ZsxLN2CkJCbFgV4g=="),
+    os.environ.get("GUMROAD_MCP_DEV_PRODUCT_ID", "Njr2Z0MyaWSp7WuJhVHDqg=="),
+]
 GUMROAD_TOKEN = os.environ.get("GUMROAD_ACCESS_TOKEN", "")
 BUY_URL = "https://niebingyu.gumroad.com/l/njpksu"
+DEV_BUY_URL = "https://niebingyu.gumroad.com/l/xrckli"
 FREE_AUDITS_PER_EMAIL = 1
 
 # 30 项检查清单（5 类 × 6 项）
@@ -142,21 +150,22 @@ def _verify_license(license_key: str) -> dict:
     if not GUMROAD_TOKEN:
         return {"valid": False, "reason": "server license verification not configured"}
     try:
-        data = urllib.parse.urlencode({
-            "product_id": GUMROAD_PRODUCT_ID,
-            "license_key": license_key,
-            "access_token": GUMROAD_TOKEN,
-        }).encode()
-        req = urllib.request.Request("https://api.gumroad.com/v2/licenses/verify", data=data, method="POST")
-        resp = json.loads(urllib.request.urlopen(req, timeout=20).read().decode())
-        if resp.get("success"):
-            purchase = resp.get("purchase", {})
-            if purchase.get("refunded") or purchase.get("chargebacked"):
-                return {"valid": False, "reason": "purchase refunded/chargebacked"}
-            email = purchase.get("email", "")
-            cache[license_key] = {"email": email, "verified_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
-            _save_json(LICENSE_CACHE, cache)
-            return {"valid": True, "email": email}
+        for product_id in GUMROAD_PRODUCT_IDS:
+            data = urllib.parse.urlencode({
+                "product_id": product_id,
+                "license_key": license_key,
+                "access_token": GUMROAD_TOKEN,
+            }).encode()
+            req = urllib.request.Request("https://api.gumroad.com/v2/licenses/verify", data=data, method="POST")
+            resp = json.loads(urllib.request.urlopen(req, timeout=20).read().decode())
+            if resp.get("success"):
+                purchase = resp.get("purchase", {})
+                if purchase.get("refunded") or purchase.get("chargebacked"):
+                    return {"valid": False, "reason": "purchase refunded/chargebacked"}
+                email = purchase.get("email", "")
+                cache[license_key] = {"email": email, "verified_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
+                _save_json(LICENSE_CACHE, cache)
+                return {"valid": True, "email": email}
         return {"valid": False, "reason": "invalid license key"}
     except urllib.error.HTTPError as e:
         if e.code == 404:
@@ -185,6 +194,31 @@ def _check_free_quota(email: str) -> dict:
     return {"allowed": True, "remaining_free": FREE_AUDITS_PER_EMAIL - rec["count"]}
 
 
+def _log_usage(identifier: str, brand: str):
+    """计量每次深度诊断调用，为按量计费（L2/L3）打基础。identifier = api_key/license/email。"""
+    try:
+        usage = _load_json(USAGE_FILE, {})
+        rec = usage.get(identifier, {"count": 0, "brands": []})
+        rec["count"] = rec.get("count", 0) + 1
+        rec["last_called"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        rec["brands"] = (rec.get("brands", []) + [brand])[-10:]
+        usage[identifier] = rec
+        _save_json(USAGE_FILE, usage)
+    except Exception:
+        pass  # 计量失败不影响主流程
+
+
+def _get_usage(identifier: str) -> dict:
+    usage = _load_json(USAGE_FILE, {})
+    rec = usage.get(identifier, {"count": 0})
+    return {
+        "identifier": identifier,
+        "total_audits": rec.get("count", 0),
+        "last_called": rec.get("last_called", ""),
+        "recent_brands": rec.get("brands", []),
+    }
+
+
 def _score_to_tier(score: int) -> dict:
     for lo, hi, tier, note in TIERS:
         if lo <= score <= hi:
@@ -198,21 +232,25 @@ def audit_ai_visibility(
     category: str = "",
     email: str = "",
     license_key: str = "",
+    api_key: str = "",
     score: int = -1,
 ) -> dict:
     """Deep-audit a brand's visibility in AI answers (ChatGPT, Perplexity, AI Overviews).
 
     FREE TIER: 1 full deep audit per email — pass your email to unlock it.
-    UNLIMITED: pass a license_key from https://niebingyu.gumroad.com/l/njpksu ($29/year).
-    Without email/license you get the audit framework and tier mapping only.
+    DEVELOPER/UNLIMITED: pass an api_key (or license_key) from a developer subscription
+    at https://niebingyu.gumroad.com/l/njpksu to run audits programmatically with no email.
+    Without email/api_key you get the audit framework and tier mapping only.
 
     Args:
         brand_name: The brand/company to audit.
         category: Product/service category (e.g. "phone case", "DTC fashion").
         email: Your email — unlocks 1 free full audit.
         license_key: Gumroad license key — unlocks unlimited full audits.
+        api_key: Developer API key — equivalent to license_key, for agent/API callers.
         score: Optional known 0-30 checklist score. If provided, a tier + fix plan is included for free.
     """
+    license_key = (license_key or api_key).strip()
     result = {
         "brand_name": brand_name,
         "category": category,
@@ -249,6 +287,9 @@ def audit_ai_visibility(
             return result
         result["access"] = "free"
         result["remaining_free_audits"] = q.get("remaining_free", 0)
+
+    # 计量本次深度诊断调用（为 L2/L3 按量计费打基础）
+    _log_usage((license_key or email or "anonymous").strip(), brand_name)
 
     # —— 深度诊断内容（需授权）——
     result["deep_playbook"] = DEEP_PLAYBOOK
@@ -294,6 +335,17 @@ def check_license(license_key: str) -> dict:
     if lic.get("valid"):
         return {"valid": True, "email": lic.get("email"), "unlimited_audits": True}
     return {"valid": False, "reason": lic.get("reason"), "buy_url": BUY_URL}
+
+
+@mcp.tool()
+def get_usage(api_key: str = "") -> dict:
+    """Report the caller's API usage volume (total audits, last called, recent brands).
+
+    Args:
+        api_key: Your developer API key / license key. If empty, reports the anonymous/free-trial usage.
+    """
+    ident = (api_key or "").strip() or "anonymous"
+    return _get_usage(ident)
 
 
 if __name__ == "__main__":
