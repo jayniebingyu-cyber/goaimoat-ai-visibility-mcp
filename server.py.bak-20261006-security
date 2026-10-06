@@ -1,0 +1,220 @@
+"""GoAI Moat — AI Visibility MCP
+
+Multi-model AI visibility audit for any website. Asks ChatGPT (consumer app via Monid cloro),
+Perplexity, and Grok what they know about a brand, scans the site for GEO/SEO health, and returns
+a 0-100 score with benchmark percentile.
+
+Pricing: free 3 audits/email; then $98/month subscription (10/day, 100/month).
+"""
+from fastmcp import FastMCP
+import os, json, sys, time, urllib.request, urllib.parse
+from pathlib import Path
+
+# 复用核心审计逻辑（同目录 geo_seo_audit.py）
+sys.path.insert(0, str(Path(__file__).parent))
+from geo_seo_audit import scan_site, infer_brand, ai_probe, score_site
+
+QUOTA_DIR = os.environ.get("QUOTA_DIR", "/opt/gg-ai-brief/ai-visibility")
+FREE_LIMIT = 3          # 免费 3 次/邮箱
+DAILY_LIMIT = 10        # 订阅后每天 10 次
+MONTHLY_LIMIT = 100     # 订阅后每月 100 次
+LICENSE_PRICE = "$98/month (10/day, 100/month)"
+BUY_LINK = "https://goaimoat.gumroad.com/l/sygcbj"
+GUMROAD_PRODUCT_ID = "ynVlq7OvaTcZu-ABGwlmIw=="
+VERIFY_URL = "https://api.gumroad.com/v2/licenses/verify"
+
+mcp = FastMCP(
+    name="GoAI Moat — AI Visibility",
+    instructions=(
+        "AI visibility audit for any website or brand. Asks ChatGPT, Perplexity and Grok what they "
+        "know about the brand, scans the site for GEO/SEO health, and returns a 0-100 score with "
+        "benchmark percentile. Free 3 audits per email; then $98/month subscription (10/day, 100/month)."
+    ),
+)
+
+
+def _quota_file():
+    return Path(QUOTA_DIR) / "quota.json"
+
+
+def _load_quota():
+    f = _quota_file()
+    if f.exists():
+        try:
+            return json.loads(f.read_text())
+        except Exception:
+            pass
+    return {}
+
+
+def _save_quota(q):
+    _quota_file().parent.mkdir(parents=True, exist_ok=True)
+    _quota_file().write_text(json.dumps(q, ensure_ascii=False, indent=2))
+
+
+def _now():
+    return int(time.time())
+
+
+def _check_access(email: str) -> dict:
+    """检查额度。返回 {"ok": bool, "reason": str}"""
+    if not email:
+        return {"ok": False, "reason": "email parameter required (for quota tracking)"}
+    q = _load_quota()
+    rec = q.get(email, {})
+    now = _now()
+
+    # license（$98/月）有效期内
+    if rec.get("license_until", 0) > now:
+        today = time.strftime("%Y-%m-%d")
+        month = time.strftime("%Y-%m")
+        # 每日限制
+        if rec.get("daily_date") != today:
+            rec["daily_date"] = today
+            rec["daily_count"] = 0
+        if rec.get("daily_count", 0) >= DAILY_LIMIT:
+            q[email] = rec
+            _save_quota(q)
+            return {"ok": False, "reason": f"daily limit reached ({DAILY_LIMIT}/day)"}
+        # 每月限制
+        if rec.get("monthly_month") != month:
+            rec["monthly_month"] = month
+            rec["monthly_count"] = 0
+        if rec.get("monthly_count", 0) >= MONTHLY_LIMIT:
+            q[email] = rec
+            _save_quota(q)
+            return {"ok": False, "reason": f"monthly limit reached ({MONTHLY_LIMIT}/month)"}
+        rec["daily_count"] = rec.get("daily_count", 0) + 1
+        rec["monthly_count"] = rec.get("monthly_count", 0) + 1
+        q[email] = rec
+        _save_quota(q)
+        return {"ok": True, "reason": f"subscription ({rec['daily_count']}/{DAILY_LIMIT} today)"}
+
+    # 免费额度
+    if rec.get("count", 0) < FREE_LIMIT:
+        rec["count"] = rec.get("count", 0) + 1
+        q[email] = rec
+        _save_quota(q)
+        return {"ok": True, "reason": f"free {rec['count']}/{FREE_LIMIT}"}
+
+    return {"ok": False, "reason": f"free quota used ({FREE_LIMIT} audits). Subscribe {LICENSE_PRICE}: {BUY_LINK}"}
+
+
+def _verify_gumroad(license_key: str) -> bool:
+    """调用 Gumroad 官方接口真校验 license_key（product_id + license_key）。"""
+    try:
+        data = urllib.parse.urlencode({
+            "product_id": GUMROAD_PRODUCT_ID,
+            "license_key": (license_key or "").strip(),
+            "increment_uses_count": "false",
+        }).encode()
+        req = urllib.request.Request(VERIFY_URL, data=data, method="POST",
+                                     headers={"Content-Type": "application/x-www-form-urlencoded"})
+        with urllib.request.urlopen(req, timeout=12) as r:
+            body = json.loads(r.read().decode("utf-8", "ignore"))
+        return bool(body.get("success"))
+    except Exception:
+        return False
+
+
+@mcp.tool()
+def check_license(license_key: str, email: str) -> dict:
+    """Activate a monthly subscription license ($98/month, 10/day, 100/month).
+
+    Args:
+        license_key: The Gumroad license key (from your purchase at the buy link).
+        email: Email to bind the license to.
+    """
+    if not email:
+        return {"ok": False, "message": "email required"}
+    if not _verify_gumroad(license_key):
+        return {"ok": False, "message": f"invalid license key. Buy at {BUY_LINK}"}
+    q = _load_quota()
+    rec = q.get(email, {})
+    # 订阅 30 天
+    rec["license_until"] = _now() + 30 * 86400
+    rec["daily_date"] = ""
+    rec["monthly_month"] = ""
+    q[email] = rec
+    _save_quota(q)
+    return {"ok": True, "message": f"subscription activated for 30 days ({DAILY_LIMIT}/day, {MONTHLY_LIMIT}/month)"}
+
+
+@mcp.tool()
+def audit_ai_visibility(url: str, email: str = "") -> dict:
+    """Full AI visibility audit of a website: multi-model AI mentions + GEO/SEO health + score.
+
+    Asks ChatGPT (consumer app), Perplexity and Grok what they know about the brand, scans the site,
+    and returns a 0-100 composite score with benchmark percentile and prioritized issues.
+
+    Args:
+        url: Website URL (e.g. "https://example.com").
+        email: Your email (for quota tracking).
+    """
+    access = _check_access(email)
+    if not access["ok"]:
+        return {"ok": False, "quota": access["reason"]}
+
+    url = url.strip().rstrip("/")
+    if not url.startswith("http"):
+        url = "https://" + url
+
+    checks = scan_site(url)
+    if not checks.get("accessible"):
+        return {"ok": False, "url": url, "error": "site not accessible", "detail": checks.get("error")}
+
+    brand = infer_brand(checks)
+    probe = ai_probe(brand)
+    s = score_site(checks, probe)
+
+    return {
+        "ok": True,
+        "url": url,
+        "brand": brand,
+        "score": s["total"],
+        "seo_score": s["seo"],
+        "geo_score": s["geo"],
+        "benchmark_percentile": s["percentile"],
+        "ai_mentions": [
+            {"model": p["model"], "angle": p["angle"], "mentioned": p["mentioned"], "answer": p["answer"]}
+            for p in probe
+        ],
+        "quota": access["reason"],
+    }
+
+
+@mcp.tool()
+def check_ai_mentions(brand: str, email: str = "") -> dict:
+    """Quick check: what do ChatGPT, Perplexity and Grok say about a brand?
+
+    Returns per-model mentions and answers, without the full site scan.
+
+    Args:
+        brand: Brand name (e.g. "RolePaths").
+        email: Your email (for quota tracking).
+    """
+    access = _check_access(email)
+    if not access["ok"]:
+        return {"ok": False, "quota": access["reason"]}
+
+    probe = ai_probe(brand.strip())
+    mentioned = [p["model"] for p in probe if p.get("mentioned")]
+    return {
+        "ok": True,
+        "brand": brand.strip(),
+        "mentioned_models": mentioned,
+        "snapshots": [
+            {"model": p["model"], "angle": p["angle"], "mentioned": p["mentioned"], "answer": p["answer"]}
+            for p in probe
+        ],
+        "quota": access["reason"],
+    }
+
+
+if __name__ == "__main__":
+    transport = os.getenv("MCP_TRANSPORT", "stdio")
+    if transport == "streamable-http":
+        mcp.run(transport="streamable-http", host=os.getenv("MCP_HOST", "127.0.0.1"),
+                port=int(os.getenv("MCP_PORT", "8020")))
+    else:
+        mcp.run()
