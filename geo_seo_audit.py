@@ -196,6 +196,29 @@ def load_credentials():
     return creds
 
 
+def _sanitize_prompt(s, max_len=2000):
+    """清洗传入 LLM / 子进程的文本：去控制字符（保留 \\n \\t），截断超长。
+
+    防提示注入与异常字节输入；不改变正常中英文内容。
+    """
+    if not isinstance(s, str):
+        s = str(s)
+    s = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", s)
+    return s[:max_len]
+
+
+def _monid_env(key):
+    """构造传给 monid 子进程的最小环境：只给 MONID_API_KEY + PATH + HOME。
+
+    不再透传 os.environ 全量环境（避免把父进程里的其它密钥泄漏给子进程）。
+    """
+    return {
+        "MONID_API_KEY": key,
+        "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+        "HOME": os.environ.get("HOME", "/root"),
+    }
+
+
 def google_index_lookup(domain):
     """用 Serper 查 Google 真实索引，拿 title/description（绕过 Cloudflare 拦截）。
 
@@ -276,7 +299,9 @@ def call_chatgpt_cloro(prompt, country="US"):
     key = load_credentials().get("MONID_API_KEY", "")
     if not key:
         return None, "未配置 MONID_API_KEY"
-    env = {**os.environ, "MONID_API_KEY": key}
+    prompt = _sanitize_prompt(prompt)
+    country = _sanitize_prompt(country, max_len=8)
+    env = _monid_env(key)
     try:
         r = subprocess.run(
             ["monid", "run", "-p", "cloro", "-e", "/chatgpt/ask", "-i",
@@ -317,7 +342,8 @@ def call_chatgpt_blockrun(prompt, model="gpt-4o-mini"):
     key = load_credentials().get("MONID_API_KEY", "")
     if not key:
         return None, "未配置 MONID_API_KEY"
-    env = {**os.environ, "MONID_API_KEY": key}
+    prompt = _sanitize_prompt(prompt)
+    env = _monid_env(key)
     try:
         body = json.dumps({"model": model,
                            "messages": [{"role": "user", "content": prompt}],
@@ -582,6 +608,8 @@ def ai_probe(brand_name, category=""):
     返回结构化结果：每个（模型 × 问题）→ 是否提到品牌 + AI 的回答。
     这是「AI 里你是什么样子」的核心证据，零虚构（真实提问记录）。
     """
+    brand_name = _sanitize_prompt(brand_name, max_len=120)
+    category = _sanitize_prompt(category, max_len=60)
     probes = [
         ("发现", f"What are the best {category or 'products'} brands? Give your top recommendations."),
         ("认知", f"What do you know about {brand_name}? What do they sell and what's their reputation?"),

@@ -7,8 +7,9 @@ a 0-100 score with benchmark percentile.
 Pricing: free 3 audits/email; then $98/month subscription (10/day, 100/month).
 """
 from fastmcp import FastMCP
-import os, json, sys, time
+import os, json, sys, time, urllib.request, urllib.parse
 from pathlib import Path
+import re
 
 # 复用核心审计逻辑（同目录 geo_seo_audit.py）
 sys.path.insert(0, str(Path(__file__).parent))
@@ -19,7 +20,9 @@ FREE_LIMIT = 3          # 免费 3 次/邮箱
 DAILY_LIMIT = 10        # 订阅后每天 10 次
 MONTHLY_LIMIT = 100     # 订阅后每月 100 次
 LICENSE_PRICE = "$98/month (10/day, 100/month)"
-BUY_LINK = "https://niebingyu.gumroad.com/l/ai-visibility"
+BUY_LINK = "https://goaimoat.gumroad.com/l/sygcbj"
+GUMROAD_PRODUCT_ID = "ynVlq7OvaTcZu-ABGwlmIw=="
+VERIFY_URL = "https://api.gumroad.com/v2/licenses/verify"
 
 mcp = FastMCP(
     name="GoAI Moat — AI Visibility",
@@ -52,6 +55,24 @@ def _save_quota(q):
 
 def _now():
     return int(time.time())
+
+
+def _sanitize_text(s, max_len=200):
+    """清洗工具入参：去控制字符、截断超长（防提示注入/异常字节）。"""
+    if not isinstance(s, str):
+        s = str(s)
+    s = re.sub(r"[\x00-\x1f\x7f]", "", s)
+    return s[:max_len]
+
+
+def _sanitize_url(url, max_len=300):
+    """清洗并校验 URL：只允许 http/https，去控制字符，截断。"""
+    if not isinstance(url, str):
+        return ""
+    url = re.sub(r"[\x00-\x1f\x7f]", "", url).strip().rstrip("/")[:max_len]
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    return url
 
 
 def _check_access(email: str) -> dict:
@@ -98,16 +119,35 @@ def _check_access(email: str) -> dict:
     return {"ok": False, "reason": f"free quota used ({FREE_LIMIT} audits). Subscribe {LICENSE_PRICE}: {BUY_LINK}"}
 
 
+def _verify_gumroad(license_key: str) -> bool:
+    """调用 Gumroad 官方接口真校验 license_key（product_id + license_key）。"""
+    try:
+        data = urllib.parse.urlencode({
+            "product_id": GUMROAD_PRODUCT_ID,
+            "license_key": (license_key or "").strip(),
+            "increment_uses_count": "false",
+        }).encode()
+        req = urllib.request.Request(VERIFY_URL, data=data, method="POST",
+                                     headers={"Content-Type": "application/x-www-form-urlencoded"})
+        with urllib.request.urlopen(req, timeout=12) as r:
+            body = json.loads(r.read().decode("utf-8", "ignore"))
+        return bool(body.get("success"))
+    except Exception:
+        return False
+
+
 @mcp.tool()
 def check_license(license_key: str, email: str) -> dict:
     """Activate a monthly subscription license ($98/month, 10/day, 100/month).
 
     Args:
-        license_key: The license key (starts with "av-").
+        license_key: The Gumroad license key (from your purchase at the buy link).
         email: Email to bind the license to.
     """
-    if not license_key.startswith("av-"):
-        return {"ok": False, "message": "invalid license key"}
+    if not email:
+        return {"ok": False, "message": "email required"}
+    if not _verify_gumroad(license_key):
+        return {"ok": False, "message": f"invalid license key. Buy at {BUY_LINK}"}
     q = _load_quota()
     rec = q.get(email, {})
     # 订阅 30 天
@@ -134,9 +174,9 @@ def audit_ai_visibility(url: str, email: str = "") -> dict:
     if not access["ok"]:
         return {"ok": False, "quota": access["reason"]}
 
-    url = url.strip().rstrip("/")
-    if not url.startswith("http"):
-        url = "https://" + url
+    url = _sanitize_url(url)
+    if not url:
+        return {"ok": False, "error": "invalid URL"}
 
     checks = scan_site(url)
     if not checks.get("accessible"):
@@ -176,11 +216,15 @@ def check_ai_mentions(brand: str, email: str = "") -> dict:
     if not access["ok"]:
         return {"ok": False, "quota": access["reason"]}
 
-    probe = ai_probe(brand.strip())
+    brand = _sanitize_text(brand, max_len=120)
+    if not brand:
+        return {"ok": False, "message": "brand required"}
+
+    probe = ai_probe(brand)
     mentioned = [p["model"] for p in probe if p.get("mentioned")]
     return {
         "ok": True,
-        "brand": brand.strip(),
+        "brand": brand,
         "mentioned_models": mentioned,
         "snapshots": [
             {"model": p["model"], "angle": p["angle"], "mentioned": p["mentioned"], "answer": p["answer"]}
